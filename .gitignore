@@ -1,0 +1,16 @@
+# spyder project
+.spyproject
+
+# notebook stuff
+.ipynb_checkpoints
+
+# large data files
+data/LibriSpeech/
+data/noise/
+*.wav
+*.tar
+*.gz
+*.pt
+
+# pycache
+__pycache__/
