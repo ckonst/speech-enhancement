@@ -83,7 +83,7 @@ def create_dataset(librispeech):
     for n, (waveform, _, _, _, _, _) in enumerate(librispeech):
         waveform = lb.resample(waveform.squeeze(0).numpy(), 16000, fs) # LIBRISPEECH is sampled at 16 kHz
         feature = get_spectrogram_tensor(add_noise(waveform, source=random.choice(sources))).unsqueeze(1)
-        target = get_spectrogram_tensor(waveform).unsqueeze(1)
+        target = get_spectrogram_tensor(waveform)
         dataset.append((feature, target))
         if n == 100:
             break
@@ -121,22 +121,19 @@ class CR_CNN(nn.Module):
         super(CR_CNN, self).__init__()
         self.relu = nn.ReLU(inplace=True).to(device)
         self.bn = nn.BatchNorm2d(1).to(device)
-        self.conv1 = nn.Conv2d(1, 1, (9, 8), padding=4).to(device)
-        self.conv2 = nn.Conv2d(1, 1, (5, 1), padding=4).to(device)
-        self.conv3 = nn.Conv2d(1, 1, (9, 1), padding=4).to(device)
-        self.conv4 = nn.Conv2d(1, 1, (128, 1), padding=4).to(device)
-        self.block = nn.Sequential(self.conv2, self.relu, self.bn,
-                                   self.conv3, self.relu, self.bn,
-                                   self.conv3, self.relu, self.bn
-                                  ).to(device)
-        self.chonk = nn.Sequential(self.block, self.block, self.block, self.block).to(device)
+        self.bn2 = nn.BatchNorm2d(2).to(device)
+        self.bn3 = nn.BatchNorm2d(4).to(device)
+        self.conv1 = nn.Conv2d(1, 2, 3, padding=3).to(device)
+        self.conv2 = nn.Conv2d(2, 4, 2).to(device)
+        self.conv3 = nn.Conv2d(4, 2, 2).to(device)
+        self.conv4 = nn.Conv2d(2, 1, 3).to(device)
 
     def forward(self, x):
-        x = self.bn(self.relu(self.conv1(x)))
-        x = self.chonk(x)
-        x = self.bn(self.relu(self.conv2(x)))
-        x = self.bn(self.relu(self.conv3(x)))
+        x = self.bn2(self.relu(self.conv1(x)))
+        x = self.bn3(self.relu(self.conv2(x)))
+        x = self.bn2(self.relu(self.conv3(x)))
         x = self.bn(self.relu(self.conv4(x)))
+        x = x.squeeze(1)
         return x
 
 # evaluation metric
@@ -161,14 +158,12 @@ def SDR(f, y):
 
 #%% Hyperparameters
 
-model = CR_CNN()
+model = CR_CNN().to(device)
 loss_function = nn.MSELoss()
 optimizer = optim.Adam(params=model.parameters(), lr=0.0015)
-patience = 4
-epochs = 10
+patience = 6
+epochs = 20
 hidden_size = 10
-layers = 3
-dev_losses = []
 no_improve = 0
 
 #%% Training
@@ -178,27 +173,32 @@ def train(model, training_data, optimizer, loss_function):
         print(f'Starting epoch {epoch}...')
         for feature, target in training_data:
             model.zero_grad()
-            output = model(torch.FloatTensor(feature.float()).to(device))
-            print(output.shape)
-            print(torch.FloatTensor(target.float()).to(device).shape)
-            loss = loss_function(output, torch.FloatTensor(target.float()).to(device))
+            feature, target = feature.type(torch.FloatTensor), target.type(torch.FloatTensor)
+            feature, target = feature.to(device), target.to(device)
+            output = model(feature)
+            loss = loss_function(output, target)
             loss.backward()
             optimizer.step()
+        print(f'epoch {epoch} training loss: {loss}')
 
         # validate
         with torch.no_grad():
+            min_loss = 9999
             for feature, target in dev_data:
-                output = model(feature.to(device))
-                loss = loss_function(output, target.to(device))
-                if not dev_losses or loss >= max(dev_losses):
-                    no_improve = 0
-                    torch.save('../data/model.pt')
-                else:
-                    no_improve += 1
-                dev_losses.append(loss)
-                if no_improve >= patience:
+                feature, target = feature.type(torch.FloatTensor), target.type(torch.FloatTensor)
+                feature, target = feature.to(device), target.to(device)
+                output = model(feature)
+                dev_loss = loss_function(output, target)
+            if dev_loss < min_loss:
+                no_improve = 0
+                torch.save(model, f'{DATA_PATH}/model.pt')
+            else:
+                no_improve += 1
+                min_loss = min(dev_loss, min_loss)
+            if no_improve >= patience:
                     print(f'Patience exceeded! ({patience} epochs with no accuracy improvement). Stopping early.')
-                    break
+                    return
+            print(f'epoch {epoch} validation loss: {dev_loss}')
 
 train(model, train_data, optimizer, loss_function)
 
@@ -206,12 +206,17 @@ train(model, train_data, optimizer, loss_function)
 
 def test(model, testing_data):
     evaluations = []
+    outputs = []
     with torch.no_grad():
         for feature, target in testing_data:
-            output = model(feature.to(device))
-            evaluations.append(SDR(output, target))
-    return evaluations
+            feature, target = feature.type(torch.FloatTensor), target.type(torch.FloatTensor)
+            feature, target = feature.to(device), target.to(device)
+            output = model(feature)
+            evaluations.append(SDR(output.cpu(), target.cpu()))
+            outputs.append(output)
+    return evaluations, outputs
 
+evaluations, outputs = test(model, test_data)
 #%% Other
 
 def spectrogram_to_audio(spectrogram, fs):
